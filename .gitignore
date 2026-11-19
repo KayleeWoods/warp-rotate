@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# Artifacts
+.pytest_cache/
+*.log
+
+# Local-only
+.env

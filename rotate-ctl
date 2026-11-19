@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# rotate-ctl - CLI manager for the WARP rotation sidecar (:40100)
+# Commands: start, stop, restart, status, logs, rotate, test
+#
+# Conventions mirror tools/captcha-solver/solve-ctl: a PID file plus a log file
+# under /tmp, and process discovery by listening port (never a broad pkill).
+
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+PORT="${PORT:-40100}"
+LOG_FILE="${WARP_ROTATE_LOG:-/tmp/warp_rotate.log}"
+RUN_LOG="/tmp/warp_rotate_run.log"
+PID_FILE="/tmp/warp_rotate_${PORT}.pid"
+BASE_URL="http://127.0.0.1:${PORT}"
+
+is_running() {
+    if command -v fuser >/dev/null 2>&1; then
+        fuser "${PORT}/tcp" >/dev/null 2>&1
+    else
+        ss -tlnp "sport = :${PORT}" 2>/dev/null | grep -q "${PORT}"
+    fi
+}
+
+# PID of the process listening on $PORT (empty when free).
+port_pid() {
+    if command -v fuser >/dev/null 2>&1; then
+        fuser "${PORT}/tcp" 2>/dev/null | awk '{print $1}'
+    else
+        ss -tlnp "sport = :${PORT}" 2>/dev/null | grep -oP 'pid=\K\d+' | head -n1
+    fi
+}
+
+# PID recorded by the last start, only if that process is still ours.
+pid_file_pid() {
+    [ -f "$PID_FILE" ] || return 0
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [ -n "$pid" ] || return 0
+    if [ -r "/proc/${pid}/cmdline" ] && tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -q "warp-rotate/server.py"; then
+        echo "$pid"
+    fi
+}
+
+# Never match this script's own command line: resolve the listener instead.
+resolve_pid() {
+    local pid
+    pid="$(port_pid)"
+    if [ -n "$pid" ]; then
+        echo "$pid"
+        return 0
+    fi
+    pid_file_pid
+}
+
+start_service() {
+    if is_running; then
+        echo "WARP rotator is already running on port ${PORT} (PID: $(port_pid))."
+        return 0
+    fi
+
+    echo "Starting WARP rotator on port ${PORT}..."
+    setsid nohup ./start.sh > "$RUN_LOG" 2>&1 < /dev/null &
+    echo $! > "$PID_FILE"
+
+    echo -n "Waiting for the API to become ready..."
+    for _ in {1..30}; do
+        if curl -s -m 2 "${BASE_URL}/health" >/dev/null 2>&1; then
+            echo " Ready!"
+            echo "Status  : ONLINE (PID: $(port_pid))"
+            echo "Endpoint: ${BASE_URL}"
+            echo "Log     : ${LOG_FILE}"
+            echo "Idle auto-shutdown: ${IDLE_SHUTDOWN_S:-1800}s"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo " FAILED to respond within 30s. Check logs: ${RUN_LOG}"
+    return 1
+}
+
+stop_service() {
+    if ! is_running; then
+        echo "WARP rotator is not running."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    local pid
+    pid="$(resolve_pid)"
+    echo "Stopping WARP rotator (PID: ${pid:-unknown})..."
+    if [ -n "$pid" ]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in {1..15}; do
+            is_running || break
+            sleep 1
+        done
+    fi
+
+    if is_running; then
+        echo "Force killing the remaining listener on port ${PORT}..."
+        if command -v fuser >/dev/null 2>&1; then
+            fuser -k "${PORT}/tcp" 2>/dev/null || true
+        else
+            pid="$(port_pid)"
+            [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        fi
+        sleep 1
+    fi
+
+    rm -f "$PID_FILE"
+    if is_running; then
+        echo "WARNING: port ${PORT} is still in use."
+        return 1
+    fi
+    echo "Stopped. Port ${PORT} released."
+}
+
+status_service() {
+    if ! is_running; then
+        echo "Status: OFFLINE (port ${PORT} free)"
+        return 0
+    fi
+
+    local pid
+    pid="$(resolve_pid)"
+    echo "Status: ONLINE"
+    echo "Port  : ${PORT} (PID: ${pid:-unknown})"
+
+    if [ -n "$pid" ] && [ -r "/proc/${pid}/status" ]; then
+        local rss_mb
+        rss_mb="$(awk '/VmRSS/ {printf "%.1f", $2/1024}' "/proc/${pid}/status" 2>/dev/null || echo "?")"
+        echo "RAM   : ~${rss_mb} MB"
+    fi
+
+    local health
+    health="$(curl -s -m 5 "${BASE_URL}/health" 2>/dev/null || echo "")"
+    if [ -n "$health" ]; then
+        echo "Health: ${health}"
+    else
+        echo "Health: UNREACHABLE"
+    fi
+
+    local current
+    current="$(curl -s -m 10 "${BASE_URL}/current" 2>/dev/null || echo "")"
+    [ -n "$current" ] && echo "Exit  : ${current}"
+
+    echo "Logs  : tail -f ${LOG_FILE}"
+}
+
+logs_service() {
+    tail -n 30 -f "$LOG_FILE"
+}
+
+rotate_service() {
+    local query=""
+    if [ "${1:-}" = "--full" ] || [ "${1:-}" = "full" ]; then
+        query="?full=true"
+    fi
+    if ! is_running; then
+        echo "WARP rotator is not running. Start it first: ./rotate-ctl start"
+        return 1
+    fi
+    echo "Rotating WARP exit IP${query:+ (full re-registration)}..."
+    curl -s -m 300 -X POST "${BASE_URL}/rotate${query}"
+    echo
+}
+
+test_service() {
+    if ! is_running; then
+        echo "WARP rotator is not running. Start it first: ./rotate-ctl start"
+        return 1
+    fi
+
+    echo "Running live self-test on ${BASE_URL}..."
+    python3 - "$BASE_URL" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+base = sys.argv[1]
+
+
+def call(path, payload=None, timeout=300, method=None):
+    url = base + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    verb = method or ("POST" if data else "GET")
+    req = urllib.request.Request(url, data=data, method=verb)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    started = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode()), round(time.time() - started, 2)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}, round(time.time() - started, 2)
+
+
+def report(name, ok, detail):
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:18} -> {detail}")
+
+
+health, dur = call("/health")
+report("health", bool(health.get("ok")), f"{health} ({dur}s)")
+
+current, dur = call("/current")
+report("current", bool(current.get("ip")), f"ip={current.get('ip')} colo={current.get('colo')} ({dur}s)")
+
+check, dur = call("/check", {"url": "https://cloudflare.com/cdn-cgi/trace", "timeout_s": 30})
+report("check", check.get("status_code") == 200, f"status={check.get('status_code')} ({dur}s)")
+
+rot, dur = call("/rotate", None, method="POST")
+report("rotate", bool(rot.get("ip")) and rot.get("ip") != current.get("ip"),
+       f"ip={rot.get('ip')} method={rot.get('method')} attempts={rot.get('attempts')} ({dur}s)")
+PY
+}
+
+case "${1:-status}" in
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        stop_service
+        sleep 2
+        start_service
+        ;;
+    status)
+        status_service
+        ;;
+    logs)
+        logs_service
+        ;;
+    rotate)
+        rotate_service "${2:-}"
+        ;;
+    test)
+        test_service
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|logs|rotate [--full]|test}"
+        exit 1
+        ;;
+esac
